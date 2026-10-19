@@ -1,0 +1,11 @@
+SM107 MegaMoE vLLM plugin
+Copyright 2026 Zihao Kong
+
+Includes FlashInfer SM107 MegaMoE sources (Apache-2.0),
+Copyright 2025-2026 NVIDIA and 2023-2026 FlashInfer community.
+Ported from DeepGEMM Rubin MegaMoE, Copyright (c) 2025 DeepSeek (MIT).
+Inline PTX and NVLink helpers derive from NVIDIA CuTe DSL MegaMoE
+(BSD-3-Clause, NVIDIA CORPORATION & AFFILIATES).
+Input staging and the expert adapter derive from vLLM
+(Apache-2.0, Copyright contributors to the vLLM project).
+See UPSTREAM.json and licenses/ for provenance and license texts.
