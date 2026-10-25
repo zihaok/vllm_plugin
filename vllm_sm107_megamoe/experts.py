@@ -88,6 +88,8 @@ class SM107MegaMoEExperts(DeepGemmMegaMoEExperts):
     EPLB uses vLLM's native expert-load recording, replica mapping and
     ``set_eplb_state``. The kernel addresses experts by physical id, and EPLB
     rearranges the routed weights in place through :meth:`get_expert_weights`.
+    Once EPLB is set up, a reload writes each expert into the slots of its
+    current placement.
     """
 
     _symm_buffers: ClassVar[dict[tuple, Any]] = {}
@@ -150,6 +152,23 @@ class SM107MegaMoEExperts(DeepGemmMegaMoEExperts):
         for name in LOCALIZED_WEIGHTS:
             param = getattr(self, name)
             param.data = backend.localize(param.data)
+
+    def _map_global_expert_id(self, expert_id: int) -> list[int]:
+        """Local slots of logical expert ``expert_id``, for every weight loader.
+
+        Before EPLB is set up this is vLLM's initial placement (physical ``p``
+        holds logical ``p % num_logical_experts``). Afterwards EPLB may have
+        moved the expert, so the current replica map decides; reloads are the
+        only callers then, and each pays one small device-to-host copy.
+        """
+        mapping = self.eplb_state.logical_to_physical_map
+        if mapping is None:
+            return super()._map_global_expert_id(expert_id)
+        return [
+            p - self.experts_start_idx
+            for p in mapping[expert_id].tolist()
+            if self.experts_start_idx <= p < self.experts_end_idx
+        ]
 
     def weight_loader(
         self,

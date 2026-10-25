@@ -356,3 +356,51 @@ def test_expert_weights_refuse_views_that_miss_the_kernel_memory(monkeypatch, mu
     monkeypatch.setattr(experts_cls, "_eplb_view", mutated_view)
     with pytest.raises(AssertionError, match="in place"):
         layer.get_expert_weights()
+
+
+def test_reload_after_eplb_moves_follows_the_current_placement(monkeypatch):
+    from vllm.distributed.eplb.eplb_state import compute_logical_maps
+    from vllm.model_executor.layers.fused_moe import deep_gemm_mega_moe as native
+
+    harness.install_fakes(monkeypatch.setattr, 2)
+    # Rank 1 of 2: physical experts 4..7 of 8 for 6 logical experts; the
+    # initial placement puts logical 4, 5, 0, 1 there.
+    layer = harness.make_experts(
+        _plugin_experts(),
+        "model.layers.0.experts",
+        num_experts=8,
+        num_local_experts=4,
+        start=4,
+        num_logical=6,
+        shared=True,
+        config=harness.make_config(True, "symm_mem"),
+    )
+    harness.load(layer, harness.checkpoint(0, 6))
+    pointers = [p.data_ptr() for p in layer.parameters()]
+    # EPLB moved the experts: physical -> logical is now [5, 5, 2, 0, 3, 1, 4, 4],
+    # so this rank holds logical 3, 1, 4, 4.
+    placement = torch.tensor([[5, 5, 2, 0, 3, 1, 4, 4]])
+    logical_to_physical, replica_count = compute_logical_maps(placement, 6)
+    layer.set_eplb_state(
+        0, torch.zeros(1, 8, dtype=torch.int32), logical_to_physical, replica_count
+    )
+    assert [layer._map_global_expert_id(e) for e in range(6)] == [
+        [], [1], [], [0], [2, 3], [],
+    ]  # fmt: skip
+    reference = harness.make_experts(
+        native.DeepGemmMegaMoEExperts,
+        "reference",
+        num_experts=6,
+        num_local_experts=6,
+        start=0,
+        num_logical=6,
+        shared=False,
+    )
+    shards = harness.checkpoint(1, 6)
+    harness.load(reference, shards)
+    harness.load(layer, shards)  # a reload: every shard of every expert
+    for row, expert in enumerate([3, 1, 4, 4]):
+        harness.assert_holds(layer, row, reference, expert)
+    for name in harness.LOCALIZED_WEIGHTS:
+        assert harness.padding_intact(getattr(layer, name).data), name
+    assert [p.data_ptr() for p in layer.parameters()] == pointers
