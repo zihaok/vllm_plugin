@@ -262,3 +262,62 @@ def test_eplb_layer_state_is_native(monkeypatch):
     assert state.expert_load_view.data_ptr() == load_view[2].data_ptr()
     assert state.logical_to_physical_map.data_ptr() == mapping[2].data_ptr()
     assert state.logical_replica_count.data_ptr() == count[2].data_ptr()
+
+
+@pytest.mark.parametrize("communicator", ["torch_nccl", "pynccl"])
+def test_nccl_communicators_are_refused_with_async_eplb(monkeypatch, communicator):
+    harness.install_fakes(monkeypatch.setattr, 2)
+    config = harness.make_config(True, communicator, use_async=True)
+    with pytest.raises(NotImplementedError, match="use_async") as error:
+        harness.make_experts(
+            _plugin_experts(),
+            "model.layers.0.experts",
+            num_experts=8,
+            num_local_experts=4,
+            start=0,
+            num_logical=6,
+            shared=True,
+            config=config,
+        )
+    assert "symm_mem" in str(error.value)
+    assert config.compilation_config.static_forward_context == {}
+
+
+@pytest.mark.parametrize("communicator", ["torch_nccl", "pynccl"])
+def test_vllm_also_rejects_nccl_communicators_with_async_eplb(communicator):
+    # The plugin refuses this combination itself; this records that the
+    # serving image's vLLM agrees.
+    from vllm.config.parallel import EPLBConfig
+
+    with pytest.raises(ValueError, match="async"):
+        EPLBConfig(use_async=True, communicator=communicator)
+    EPLBConfig(use_async=False, communicator=communicator)
+
+
+def test_symm_mem_eplb_communicator_synchronizes_on_the_cpu_only():
+    """The MegaMoE kernel keeps every SM resident and synchronizes them in
+    software. Async EPLB next to it is safe while symm_mem moves rows with
+    copies and waits with a host barrier; this fails if vLLM changes that."""
+    import ast
+    import inspect
+    import textwrap
+
+    from vllm.distributed.eplb.eplb_communicator import SymmMemEplbCommunicator
+
+    calls: dict = {}
+    for method in (SymmMemEplbCommunicator.execute, SymmMemEplbCommunicator._barrier):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else func.id
+                calls.setdefault(name, []).append(node)
+    assert set(calls) <= {
+        "device_stream", "_barrier", "zip", "copy_", "clear",
+        "gpu_sync_allowed", "current_stream", "synchronize", "all_reduce", "zeros",
+    }, sorted(calls)  # fmt: skip
+    (all_reduce,) = calls["all_reduce"]
+    group = next(k.value for k in all_reduce.keywords if k.arg == "group")
+    assert isinstance(group, ast.Attribute) and group.attr == "_cpu_group"
+    (zeros,) = calls["zeros"]
+    assert not any(k.arg == "device" for k in zeros.keywords)  # a host tensor

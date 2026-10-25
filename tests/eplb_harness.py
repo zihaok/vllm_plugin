@@ -103,12 +103,15 @@ def make_config(
     enable_eplb: bool = False,
     communicator: str | None = None,
     elastic_ep: bool = False,
+    use_async: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             enable_eplb=enable_eplb,
             enable_elastic_ep=elastic_ep,
-            eplb_config=SimpleNamespace(communicator=communicator),
+            eplb_config=SimpleNamespace(
+                communicator=communicator, use_async=use_async
+            ),
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
         compilation_config=SimpleNamespace(static_forward_context={}),

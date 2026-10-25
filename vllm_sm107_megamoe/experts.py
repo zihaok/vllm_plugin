@@ -25,11 +25,14 @@ LOCALIZED_WEIGHTS = ("w13_weight", "w2_weight")
 #   symm_mem    copies weight rows into its own symmetric receive buffer and
 #               synchronizes with CPU barriers only; use it with async EPLB.
 #   torch_gloo  stages rows through host memory.
-#   torch_nccl, pynccl  send and receive rows with NCCL; vLLM allows them only
-#               with synchronous EPLB.
+#   torch_nccl, pynccl  send and receive rows with NCCL; synchronous EPLB only.
 SUPPORTED_EPLB_COMMUNICATORS = frozenset(
     {"symm_mem", "torch_gloo", "torch_nccl", "pynccl"}
 )
+# NCCL kernels on the async EPLB stream would run next to the MegaMoE kernel,
+# which keeps every SM resident and synchronizes them in software. vLLM's
+# EPLBConfig rejects these with use_async as well; the plugin does not rely on it.
+_SYNC_ONLY_EPLB_COMMUNICATORS = frozenset({"torch_nccl", "pynccl"})
 _UNSUPPORTED_EPLB_COMMUNICATORS = {
     "nixl": (
         "it registers the live expert weights for RDMA reads by peers, and "
@@ -51,8 +54,18 @@ def _check_eplb(parallel_config: Any) -> None:
             "variants and symmetric buffer are built for a fixed EP size and "
             "physical expert count"
         )
-    communicator = parallel_config.eplb_config.communicator
+    eplb_config = parallel_config.eplb_config
+    communicator = eplb_config.communicator
     if communicator in SUPPORTED_EPLB_COMMUNICATORS:
+        if communicator in _SYNC_ONLY_EPLB_COMMUNICATORS and getattr(
+            eplb_config, "use_async", False
+        ):
+            raise NotImplementedError(
+                f"Plugin SM107 MegaMoE cannot use EPLB communicator "
+                f"{communicator!r} with use_async=true: its NCCL kernels would "
+                "run on the async EPLB stream next to the MegaMoE kernel, which "
+                "needs every SM. Set --eplb-config.communicator=symm_mem."
+            )
         return
     reason = _UNSUPPORTED_EPLB_COMMUNICATORS.get(
         communicator, "it has not been checked with die-local routed weights"
