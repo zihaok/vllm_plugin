@@ -321,3 +321,38 @@ def test_symm_mem_eplb_communicator_synchronizes_on_the_cpu_only():
     assert isinstance(group, ast.Attribute) and group.attr == "_cpu_group"
     (zeros,) = calls["zeros"]
     assert not any(k.arg == "device" for k in zeros.keywords)  # a host tensor
+
+
+def _shifted(view: "torch.Tensor") -> "torch.Tensor":
+    # One element further into the same allocation; die slices are padded, so
+    # this stays inside it.
+    return torch.as_strided(view, view.shape, view.stride(), view.storage_offset() + 1)
+
+
+@pytest.mark.parametrize(
+    "mutate", [lambda view: view.clone(), _shifted], ids=["copy", "shifted"]
+)
+def test_expert_weights_refuse_views_that_miss_the_kernel_memory(monkeypatch, mutate):
+    """Mutants of the die-slice views (the first views EPLB gets) must trip the
+    in-place check of get_expert_weights."""
+    harness.install_fakes(monkeypatch.setattr, 2)
+    experts_cls = _plugin_experts()
+    layer = harness.make_experts(
+        experts_cls,
+        "model.layers.0.experts",
+        num_experts=8,
+        num_local_experts=4,
+        start=4,
+        num_logical=6,
+        shared=True,
+        config=harness.make_config(True, "symm_mem"),
+    )
+    view = experts_cls._eplb_view
+
+    def mutated_view(self, name, t):
+        good = view(self, name, t)
+        return mutate(good) if name in harness.LOCALIZED_WEIGHTS else good
+
+    monkeypatch.setattr(experts_cls, "_eplb_view", mutated_view)
+    with pytest.raises(AssertionError, match="in place"):
+        layer.get_expert_weights()

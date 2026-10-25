@@ -241,15 +241,19 @@ class SM107MegaMoEExperts(DeepGemmMegaMoEExperts):
                 parts = tensor.unbind(0)
             else:
                 parts = (tensor,)
-            for part in parts:
+            for die, part in enumerate(parts):
                 view = self._eplb_view(name, part)
+                # The view must cover exactly this die slice (or the whole
+                # scale), in place: EPLB writes the kernel's memory through it.
+                offset = die * tensor.stride(0) * tensor.element_size()
                 if (
-                    view.untyped_storage().data_ptr()
-                    != tensor.untyped_storage().data_ptr()
+                    view.data_ptr() != tensor.data_ptr() + offset
+                    or view.numel() != part.numel()
+                    or not view.is_contiguous()
                 ):
                     raise AssertionError(
-                        f"Plugin SM107 MegaMoE EPLB {name}: the view does not "
-                        "alias the kernel's parameter"
+                        f"Plugin SM107 MegaMoE EPLB {name}: the view of part "
+                        f"{die} does not cover its memory in place"
                     )
                 views.append(view)
         return views
