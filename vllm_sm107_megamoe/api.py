@@ -144,8 +144,9 @@ def get_unsupported_reason_for_mega_moe(
 ) -> Optional[str]:
     """``None`` if the SM107 port can serve a MegaMoE call of this geometry, else the reason (host only).  Lets a DeepGEMM-API caller fall through to DeepGEMM
     per call.  Admitted: ``fp8xfp4`` + ``swiglu`` (``fast_math`` True and False), at most one merged shared expert, die-local routed (not shared) weights, at most 32
-    ranks, a geometry that has run on GPUs (``heuristics.VALIDATED_GEOMETRIES``, with at least 12 experts per rank; ``allow_unvalidated=True`` skips that check) and
-    every BLOCK_M variant derivable on this device.  Total: it returns a reason for any input and never raises."""
+    ranks, a geometry that has run on GPUs (``heuristics.VALIDATED_GEOMETRIES`` with at least 12 experts per rank, or an exact (num_experts, EP size) pair of
+    ``heuristics.VALIDATED_EP_GEOMETRIES``; ``allow_unvalidated=True`` skips that check) and every BLOCK_M variant derivable on this device.  Total: it returns a
+    reason for any input and never raises."""
     from .backend.heuristics import (
         get_mega_moe_unsupported_reason as _impl,
     )

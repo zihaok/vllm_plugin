@@ -1346,8 +1346,9 @@ SUPPORTED_FAST_MATH_VALUES: Tuple[bool, ...] = (
     False,
 )  # kernel/epilogue.py implements both: __expf + rcp.approx (True) and nvcc's expf + div.rn.f32 (False); bit-exact vs DeepGEMM at EP1
 
-#: Geometries that have run on Rubin (SM107) GPUs bit-exact against DeepGEMM.  The support predicate admits ONLY these (a structurally valid geometry
-#: that never ran is refused, so that a DeepGEMM-API caller such as vLLM falls through to DeepGEMM).  Key ``(hidden, intermediate_hidden, num_topk)``,
+#: Geometries that have run on Rubin (SM107) GPUs bit-exact against DeepGEMM.  The support predicate admits ONLY these and the exact pairs of
+#: :data:`VALIDATED_EP_GEOMETRIES` (a structurally valid geometry that never ran is refused, so that a DeepGEMM-API caller such as vLLM falls through to
+#: DeepGEMM).  Key ``(hidden, intermediate_hidden, num_topk)``,
 #: value ``(admitted num_experts values, evidence)``.  Extend an entry only with a GPU result (bit-exact kernel test and, for a new shape, the A/B harness).
 #: The EP size is a second dimension: a call is admitted only with at least :data:`MIN_VALIDATED_EXPERTS_PER_RANK` experts per rank.
 VALIDATED_GEOMETRIES: Dict[Tuple[int, int, int], Tuple[Tuple[int, ...], str]] = {
@@ -1366,12 +1367,42 @@ VALIDATED_GEOMETRIES: Dict[Tuple[int, int, int], Tuple[Tuple[int, ...], str]] = 
 #: top-k, tiny per-lane expert counts) take code paths that never ran, so the support predicate refuses them for every geometry of the table.
 MIN_VALIDATED_EXPERTS_PER_RANK = 12
 
+#: ``(num_experts, num_ranks)`` pairs admitted in addition to :data:`VALIDATED_GEOMETRIES`, exactly as listed and regardless of
+#: :data:`MIN_VALIDATED_EXPERTS_PER_RANK`.  Each pair ran on Rubin GPUs bit-exact against the independent DeepGEMM 3ec0eb4 C++ SM107 MegaMoE: one fused
+#: shared expert, SwiGLU clamp 10, fast_math, die-local routed weights; max_abs 0 and equal expert receive stats at every point; all six BLOCK_M variants,
+#: M = 1 .. T plus a random M per rank; gaussian routing, with Zipf + 5 % masked or hot-expert routing as extras.  Evidence: Rubin disagg campaign kernel
+#: validation, Slurm jobs 854696 and 854741, Rubin_disagg_campaign/validation/plugin_eplb/kernel_validation.md (raw rows in all_checks.jsonl).
+#: Other EP sizes of these expert counts did not run and stay refused (for example E=400 at EP4).  Key ``(hidden, intermediate_hidden, num_topk)``, value
+#: ``(admitted (num_experts, num_ranks) pairs, evidence)``.
+VALIDATED_EP_GEOMETRIES: Dict[
+    Tuple[int, int, int], Tuple[Tuple[Tuple[int, int], ...], str]
+] = {
+    (5120, 2304, 6): (
+        ((388, 4), (392, 8), (400, 8), (400, 16), (416, 32)),
+        "DeepSeek-V4.1-Flash with EPLB redundant experts (384 + R physical): R=4 at EP4, R=8 at EP8, R=16 at EP8 and EP16, R=32 at EP32; "
+        "T=2560 (aligned 3840), and also T=5120 (aligned 5760) for E=416 at EP32",
+    ),
+    (5120, 2304, 3): (
+        ((128, 16), (128, 32), (132, 4), (136, 8), (144, 8), (144, 16), (160, 32)),
+        "DSpark draft (128 logical experts, top-3) at EP16 and EP32 (8 and 4 experts per rank), and with EPLB redundant experts (128 + R physical): "
+        "R=4 at EP4, R=8 at EP8, R=16 at EP8 and EP16, R=32 at EP32; T=2560 (aligned 3840), and also T=5120 (aligned 5760) for E=128 at EP16 and EP32 "
+        "and E=160 at EP32",
+    ),
+}
+
 
 def get_validated_geometries() -> Dict[
     Tuple[int, int, int], Tuple[Tuple[int, ...], str]
 ]:
     """A copy of :data:`VALIDATED_GEOMETRIES` (``(hidden, intermediate_hidden, num_topk) -> (num_experts values, evidence)``)."""
     return dict(VALIDATED_GEOMETRIES)
+
+
+def get_validated_ep_geometries() -> Dict[
+    Tuple[int, int, int], Tuple[Tuple[Tuple[int, int], ...], str]
+]:
+    """A copy of :data:`VALIDATED_EP_GEOMETRIES` (``(hidden, intermediate_hidden, num_topk) -> ((num_experts, num_ranks) pairs, evidence)``)."""
+    return dict(VALIDATED_EP_GEOMETRIES)
 
 
 def get_mega_moe_unsupported_reason(
@@ -1399,6 +1430,7 @@ def get_mega_moe_unsupported_reason(
     on GPUs (:data:`VALIDATED_GEOMETRIES`; ``allow_unvalidated=True`` skips this check for kernel development), and every BLOCK_M variant a rank can select must
     derive a valid kernel configuration (shape divisibility, combine chunking, ring / smem sizing). The device SM count is that of the current CUDA device unless given.
     The EP size is a second validation dimension: at least :data:`MIN_VALIDATED_EXPERTS_PER_RANK` (12) experts per rank, the smallest value that has run.
+    The exact ``(num_experts, num_ranks)`` pairs of :data:`VALIDATED_EP_GEOMETRIES` are admitted as well, at those EP sizes only.
     The predicate is total: it returns a reason (never raises) for every input, including non-positive or non-integer sizes."""
     try:
         return _unsupported_reason(
@@ -1438,15 +1470,21 @@ def _unsupported_reason(
             return f"{name}={value} must be positive"
     if num_sms is not None and num_sms < 1:
         return f"num_sms={num_sms} must be positive"
-    if not allow_unvalidated:
-        entry = VALIDATED_GEOMETRIES.get((hidden, intermediate_hidden, num_topk))
+    key = (hidden, intermediate_hidden, num_topk)
+    exact_pairs = VALIDATED_EP_GEOMETRIES.get(key, ((), ""))[0]
+    if not allow_unvalidated and (num_experts, num_ranks) not in exact_pairs:
+        entry = VALIDATED_GEOMETRIES.get(key)
         if entry is None or num_experts not in entry[0]:
             known = "; ".join(
                 f"hidden={k[0]}, intermediate_hidden={k[1]}, top-k={k[2]}, num_experts in {list(v[0])}"
                 for k, v in VALIDATED_GEOMETRIES.items()
             )
+            exact = "; ".join(
+                f"hidden={k[0]}, intermediate_hidden={k[1]}, top-k={k[2]}, (num_experts, EP size) in {list(v[0])}"
+                for k, v in VALIDATED_EP_GEOMETRIES.items()
+            )
             return (f"geometry (hidden={hidden}, intermediate_hidden={intermediate_hidden}, num_experts={num_experts}, top-k={num_topk}) has not been validated on GPUs "
-                    f"(validated: {known})")  # fmt: skip
+                    f"with {num_ranks} ranks (validated: {known}; exact pairs: {exact})")  # fmt: skip
         if (
             num_experts % num_ranks == 0
             and num_experts // num_ranks < MIN_VALIDATED_EXPERTS_PER_RANK
