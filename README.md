@@ -1,5 +1,11 @@
 # SM107 MegaMoE plugin for vLLM
 
+> **NVFP4 W4A4 variant:** the `vllm_nvfp4_megamoe` package in this repository runs
+> NVFP4 checkpoints (`nvidia/DeepSeek-V4.1-Flash-NVFP4`) on NVIDIA's Rubin MegaMoE
+> kernel with the shared expert fused, and keeps MXFP4 layers (such as the DSpark
+> draft) on this plugin. Enable it with `VLLM_PLUGINS=nvfp4_megamoe`; see
+> [NVFP4.md](NVFP4.md).
+
 Opt-in Rubin SM107 MegaMoE: MXFP8 activations, MXFP4 routed weights, BF16
 output, fused FP8 shared expert, and die-local routed weights. The kernel
 and its host support are included in this wheel; no FlashInfer fork is fetched.

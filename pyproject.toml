@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-sm107-megamoe"
 version = "0.1.0"
-description = "Opt-in SM107 CuTe DSL MegaMoE experts for vLLM"
+description = "Opt-in SM107 CuTe DSL MegaMoE experts for vLLM (MXFP4 W4A8, and NVFP4 W4A4 on NVIDIA's kernel)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0 AND MIT AND BSD-3-Clause"
@@ -14,9 +14,10 @@ authors = [{name = "Zihao Kong", email = "zihaok@nvidia.com"}]
 
 [project.entry-points."vllm.general_plugins"]
 sm107_megamoe = "vllm_sm107_megamoe:register"
+nvfp4_megamoe = "vllm_nvfp4_megamoe:register"
 
 [tool.setuptools.packages.find]
-include = ["vllm_sm107_megamoe*"]
+include = ["vllm_sm107_megamoe*", "vllm_nvfp4_megamoe*"]
 
 [tool.ruff]
 extend-exclude = ["vllm_sm107_megamoe/backend", "vllm_sm107_megamoe/api.py"]
