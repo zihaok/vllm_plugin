@@ -17,6 +17,16 @@ Environment:
 ``VLLM_NVFP4_MEGAMOE_IMPL``
     JSON object of kernel-setting overrides applied to every bucket (keys of
     ``KernelSettings``).
+``VLLM_NVFP4_MEGAMOE_RUBIN_TABLE``
+    Per-bucket settings measured on Rubin (VR200) for DeepSeek-V4.1-Flash's MoE
+    shape, used instead of the checkout's GB200 table for the buckets it covers:
+    ``1`` (default) the fastest entry of each bucket, ``bitwise`` only entries whose
+    outputs are bit-identical to the GB200 table's, ``0`` off.
+``VLLM_NVFP4_MEGAMOE_RUBIN_DEDUP_MIN``
+    Smallest bucket that may use a ``combine_dedup`` entry of that table (default 0:
+    all); smaller buckets take their bit-identical entry. The dedup combine needs a
+    larger local workspace (e.g. 4.0 instead of 1.2 GiB at 12288), which vLLM then
+    no longer has for the KV cache.
 ``VLLM_NVFP4_MEGAMOE_L2_MARGIN``
     Headroom factor on the FC2 input global scale (default 1.0).
 """
@@ -72,6 +82,61 @@ class KernelSettings:
     work_id_mode: str = "atomic_counter"
     token_padding_block: int = 64
     sf_padding_block: int = 128
+    # Rank-deduplicated combine: the top-k terms of a token that land on one rank are summed there and
+    # returned as one BF16 row (needs token_back_mode reuse_dispatch_warps or standalone_warps). Not
+    # bit-identical to the default combine: each rank's partial sum is rounded to BF16 once more.
+    combine_dedup: bool = False
+    # Fused shared expert's FC2 before ("early") or after ("tail") the routed work; None: the kernel decides.
+    shared_l2_position: str | None = None
+
+
+# Rubin (VR200) settings for DeepSeek-V4.1-Flash NVFP4 (H 5120, I 2304, 384 experts, top-6) at EP4, measured on
+# rhea02 with the plugin's full layer forward (staging + kernel + top-k reduce, CUDA graph) on 2026-11-11 (campaign
+# dsv4.1_dep4_max_throughput_campaign/analysis/moe-tune/REPORT.md). Each row: (first bucket, last bucket, fastest
+# settings, fastest settings with outputs bit-identical to the GB200 table's); the last bucket of every row is the
+# measured one. Buckets outside every row keep the GB200 table.
+_RUBIN_BASE = dict(mma_tiler_mnk=(256, 256, 256), cluster_shape_mn=(4, 1), fallback_cluster_shape_mn=(2, 1),
+                   fc2_tma_stages=1, fc2_use_bulk=True, work_id_mode="atomic_counter", token_padding_block=64,
+                   sf_padding_block=128)
+
+
+def _ew(hint: int, epi: tuple[int, int], tin: int, early: bool) -> dict:
+    """Combine from the epilogue warps (the GB200 table's path): outputs bit-identical to it."""
+    return dict(schedule_policy=("phase_interleave", hint), epi_flag_batches=epi, token_in_flag_batch=tin,
+                token_back_mode="epi_warps", combine_dedup=False, shared_l2_position="early" if early else None)
+
+
+def _dedup(hint: int, epi: tuple[int, int], tin: int) -> dict:
+    """Rank-deduplicated combine from the dispatch warps (one more BF16 rounding, see KernelSettings)."""
+    return dict(schedule_policy=("phase_interleave", hint), epi_flag_batches=epi, token_in_flag_batch=tin,
+                token_back_mode="reuse_dispatch_warps", combine_dedup=True, shared_l2_position=None)
+
+
+_RUBIN_DSV41_FLASH = (
+    # first, last, fastest, bit-identical
+    (3072, 3072, _ew(3, (1, 4), 1, True), _ew(3, (1, 4), 1, True)),
+    (3200, 4096, _ew(3, (1, 4), 1, True), _ew(3, (1, 4), 1, True)),
+    (4224, 4608, _ew(3, (2, 4), 1, True), _ew(3, (2, 4), 1, True)),
+    (4736, 5632, _ew(3, (2, 4), 1, True), _ew(3, (2, 4), 1, True)),
+    (5760, 6144, _dedup(2, (1, 1), 1), _ew(3, (2, 4), 1, True)),
+    (6272, 8192, _dedup(3, (1, 1), 1), _ew(2, (2, 4), 1, False)),  # bit-identical: the GB200 entry itself
+    (8320, 10240, _dedup(3, (1, 1), 1), _ew(3, (1, 1), 1, False)),
+    (10368, 12288, _dedup(2, (1, 1), 1), _ew(3, (1, 1), 1, False)),
+)
+
+
+def _rubin_settings(bucket: int) -> "KernelSettings | None":
+    mode = os.environ.get("VLLM_NVFP4_MEGAMOE_RUBIN_TABLE", "1").strip().lower()
+    if mode in ("0", "off", "false", "no"):
+        return None
+    if mode not in ("1", "on", "true", "yes", "bitwise"):
+        raise ValueError(f"VLLM_NVFP4_MEGAMOE_RUBIN_TABLE must be 1, bitwise or 0, got {mode!r}")
+    dedup_min = int(os.environ.get("VLLM_NVFP4_MEGAMOE_RUBIN_DEDUP_MIN", "0"))
+    for first, last, fastest, bitwise in _RUBIN_DSV41_FLASH:
+        if first <= bucket <= last:
+            use_fastest = mode != "bitwise" and not (fastest["combine_dedup"] and bucket < dedup_min)
+            return KernelSettings(**_RUBIN_BASE, **(fastest if use_fastest else bitwise))
+    return None
 
 
 def _ints(text) -> tuple[int, ...]:
@@ -128,6 +193,10 @@ def kernel_settings(bucket: int, hidden: int, intermediate: int, experts: int, t
                 settings = _from_published(get_params("deepseek_v4_1_flash", "nvfp4", table_tokens))
             except Exception as error:  # noqa: BLE001 - fall back to defaults
                 logger.warning("NVFP4 MegaMoE: tuned parameters for %d tokens unusable (%s)", table_tokens, error)
+    if (hidden, intermediate, experts, topk) == (5120, 2304, 384, 6):
+        rubin = _rubin_settings(bucket)
+        if rubin is not None:
+            settings = rubin
     overrides = os.environ.get("VLLM_NVFP4_MEGAMOE_IMPL")
     if overrides:
         values = json.loads(overrides)

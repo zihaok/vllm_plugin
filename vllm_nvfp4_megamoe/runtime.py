@@ -184,6 +184,11 @@ def make_kernel(api, *, bucket, settings, counts, experts, hidden, intermediate,
             preferred_cluster_count=preferred_count,
             fallback_cluster_count=fallback_count,
         )
+    # Optional kernel fields, passed only when set so the default kernels stay exactly as before.
+    if settings.combine_dedup:
+        fields["combine_dedup"] = True
+    if settings.shared_l2_position is not None:
+        fields["shared_l2_position"] = settings.shared_l2_position
     try:
         return api.Kernel(problem, api.ImplDesc(fields))
     except ValueError as error:
