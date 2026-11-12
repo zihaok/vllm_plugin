@@ -44,9 +44,9 @@ def test_geometry_allowlist(monkeypatch):
 
     monkeypatch.delenv(config.ALLOW_UNVALIDATED_GEOMETRY_ENV, raising=False)
     shape = (5120, 2304, 6)
-    for experts, ep in ((384, 4), (384, 16)):
+    for experts, ep in ((384, 4), (384, 16), (400, 4), (400, 16)):  # validated on GPUs
         assert config.geometry_unsupported_reason(experts, ep, *shape, logical_experts=384) is None
-    for experts, ep in ((400, 16), (400, 8), (400, 4), (388, 4)):  # pending GPU validation
+    for experts, ep in ((400, 8), (388, 4)):  # pending GPU validation
         reason = config.geometry_unsupported_reason(experts, ep, *shape, logical_experts=384)
         assert reason is not None and "pending" in reason and config.ALLOW_UNVALIDATED_GEOMETRY_ENV in reason
     for experts, ep, logical in ((392, 8, 384), (100, 4, 96)):
@@ -59,7 +59,7 @@ def test_geometry_allowlist(monkeypatch):
         assert config.geometry_unsupported_reason(experts, ep, *shape, logical_experts=experts) is None
     assert config.geometry_unsupported_reason(384, 4, 4096, 2304, 6, logical_experts=384) is None
     monkeypatch.setenv(config.ALLOW_UNVALIDATED_GEOMETRY_ENV, "1")
-    for experts, ep, logical in ((400, 16, 384), (388, 4, 384), (100, 4, 96)):
+    for experts, ep, logical in ((400, 8, 384), (388, 4, 384), (100, 4, 96)):
         assert config.geometry_unsupported_reason(experts, ep, *shape, logical_experts=logical) is None
 
 

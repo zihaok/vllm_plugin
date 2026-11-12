@@ -92,7 +92,7 @@ set, and the plugin refuses `nixl`. The DEP16 decode setting:
 ```
 
 With 16 redundant experts, 384 logical experts become 400 physical experts, 25 per
-rank at EP16. That pair is pending GPU validation; see [Geometries](#geometries).
+rank at EP16. That pair is validated on GPUs; see [Geometries](#geometries).
 
 ### How it works
 
@@ -219,9 +219,9 @@ warning per process.
 | 384 | 4 | 96 | validated (`nvfp4_gpu_check.py`, DEP4 campaign) |
 | 384 | 16 | 24 | validated (deployed DEP16 decode without EPLB) |
 | 388 | 4 | 97 | pending: EPLB with 4 redundant experts at DEP4 |
-| 400 | 4 | 100 | pending: EPLB with 16 redundant experts at DEP4 |
+| 400 | 4 | 100 | validated (`nvfp4_eplb_gpu_check.py` `all` and `dedup` at EP4, job 1044262) |
 | 400 | 8 | 50 | pending: EPLB with 16 redundant experts at DEP8 |
-| 400 | 16 | 25 | pending: EPLB with 16 redundant experts at DEP16 |
+| 400 | 16 | 25 | validated (`nvfp4_eplb_gpu_check.py` `all` and `dedup` at EP16 on 4 nodes, job 1044263) |
 
 Set a pending pair to `True` in `NVFP4_GEOMETRIES` once `tests/nvfp4_eplb_gpu_check.py`
 passes `geometry`, `dedup` and `move` at that pair, and record the job there. For

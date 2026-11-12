@@ -243,9 +243,10 @@ NVFP4_GEOMETRIES: dict[tuple[int, int, int], dict[tuple[int, int], tuple[bool, s
         (384, 4): (True, "tests/nvfp4_gpu_check.py; DEP4 max-throughput campaign, 2026-11-11"),
         (384, 16): (True, "deployed DEP16 decode without EPLB"),
         (388, 4): (False, "pending GPU validation: EPLB with 4 redundant experts at DEP4 (97 per rank)"),
-        (400, 4): (False, "pending GPU validation: EPLB with 16 redundant experts at DEP4 (100 per rank)"),
+        (400, 4): (True, "tests/nvfp4_eplb_gpu_check.py all + dedup at EP4 (100 per rank), job 1044262, 2026-11-12"),
         (400, 8): (False, "pending GPU validation: EPLB with 16 redundant experts at DEP8 (50 per rank)"),
-        (400, 16): (False, "pending GPU validation: EPLB with 16 redundant experts at DEP16 (25 per rank)"),
+        (400, 16): (True, "tests/nvfp4_eplb_gpu_check.py all + dedup at EP16 on 4 nodes (25 per rank), job 1044263, "
+                          "2026-11-12"),
     },
 }
 _geometry_warned: set[tuple] = set()
