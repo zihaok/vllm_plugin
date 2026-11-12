@@ -205,7 +205,9 @@ class Nvfp4MegaMoERuntime:
     """Kernel variants, symmetric slab and staging buffers of one EP group on one device."""
 
     def __init__(self, *, ep_group, num_experts: int, hidden: int, intermediate: int, shared_intermediate: int,
-                 topk: int, clamp: float | None, max_num_tokens: int) -> None:
+                 topk: int, clamp: float | None, max_num_tokens: int, num_logical_experts: int | None = None) -> None:
+        """``num_experts`` is the PHYSICAL count (logical + EPLB redundant), which the kernel addresses and
+        splits over the ranks; ``num_logical_experts`` (default: the same) only selects the tuned settings."""
         api = import_kernel()
         os.environ.setdefault("CUTE_DSL_ARCH", "sm_107a")
         self.api = api
@@ -219,17 +221,34 @@ class Nvfp4MegaMoERuntime:
         self.max_tokens = self.buckets[-1]
         if num_experts % self.world_size:
             raise ValueError(f"{num_experts} experts do not split over {self.world_size} ranks")
+        self.num_experts = num_experts
+        self.num_logical_experts = num_experts if num_logical_experts is None else num_logical_experts
+        self.num_local_experts = num_experts // self.world_size
 
         started = time.time()
         counts = _ClusterCounts()
         self.kernels = {}
+        self.settings = {}  # bucket -> KernelSettings the kernel was built with (checked by the GPU tests)
         for bucket in self.buckets:
-            settings = kernel_settings(bucket, hidden, intermediate, num_experts, topk)
-            self.kernels[bucket] = make_kernel(
+            # Tables by the logical count (settings do not depend on E); the kernel gets the physical count.
+            settings = kernel_settings(bucket, hidden, intermediate, self.num_logical_experts, topk)
+            self.settings[bucket] = settings
+            logger.info("NVFP4 MegaMoE bucket %d (%d physical / %d logical experts, EP%d): %s", bucket,
+                        num_experts, self.num_logical_experts, self.world_size, settings)
+            kernel = make_kernel(
                 api, bucket=bucket, settings=settings, counts=counts, experts=num_experts, hidden=hidden,
                 intermediate=intermediate, shared_intermediate=shared_intermediate, topk=topk,
                 world_size=self.world_size, clamp=clamp,
             )
+            # The router drops ids >= expert_count and the top-k reduce sums every cell unmasked: a kernel built
+            # for another expert count (or with the kernel's own helper slots, which assume a fixed home/helper
+            # layout EPLB does not keep) would silently mix stale data into the output.
+            built = (getattr(kernel, "expert_count", num_experts), getattr(kernel, "local_expert_count",
+                     self.num_local_experts), getattr(kernel, "helper_expert_count", 0))
+            if built != (num_experts, self.num_local_experts, 0):
+                raise RuntimeError(f"NVFP4 MegaMoE bucket {bucket}: kernel built for (experts, local experts, "
+                                   f"helpers) {built}, expected {(num_experts, self.num_local_experts, 0)}")
+            self.kernels[bucket] = kernel
         sizes = {b: tuple(int(v) for v in k.get_workspace_sizes()) for b, k in self.kernels.items()}
         sf_cols = int(self.kernels[self.max_tokens].token_comm.activation_sf_hidden_padded)
         if sf_cols != hidden // 16:
@@ -357,12 +376,16 @@ class Nvfp4MegaMoERuntime:
         return bucket_for(self.buckets, num_tokens)
 
     def run(self, x, topk_ids, topk_weights, is_padding, *, bucket: int, layer_kwargs: dict, norm: float,
-            scale_mul: float) -> torch.Tensor:
-        """Stage ``x`` and launch the ``bucket`` variant; returns ``[bucket, H]`` BF16 (routed + shared)."""
+            scale_mul: float, eplb: tuple | None = None) -> torch.Tensor:
+        """Stage ``x`` and launch the ``bucket`` variant; returns ``[bucket, H]`` BF16 (routed + shared).
+
+        ``eplb``: the layer's ``eplb.eplb_kernel_args``; staging maps ``topk_ids`` (logical) to physical
+        replicas and records the expert load. None or inert: the ids are passed through.
+        """
         staging.stage_nvfp4_mxfp8(
             x, topk_ids, topk_weights, is_padding, norm=norm, scale_mul=scale_mul, rows=bucket,
             act=self.act, act_sf=self.act_sf, shared_act=self.sh_act, shared_act_sf=self.sh_sf,
-            ids_out=self.topk_idx, weights_out=self.topk_w,
+            ids_out=self.topk_idx, weights_out=self.topk_w, eplb=eplb,
         )
         y = torch.empty((bucket, self.hidden), dtype=torch.bfloat16, device=x.device)
         kwargs = {**self._buffer_kwargs[bucket], **layer_kwargs, "output_activation": to_cute(y, assumed_align=32),

@@ -29,6 +29,15 @@ Environment:
     no longer has for the KV cache.
 ``VLLM_NVFP4_MEGAMOE_L2_MARGIN``
     Headroom factor on the FC2 input global scale (default 1.0).
+``VLLM_NVFP4_MEGAMOE_ALLOW_UNVALIDATED_GEOMETRY``
+    ``1`` admits a (physical experts, EP size) pair with redundant (EPLB) experts
+    that is not marked validated in ``NVFP4_GEOMETRIES`` (for the GPU validation
+    runs themselves). Layouts without redundant experts never need it.
+
+The tuning tables are keyed by the model's LOGICAL expert count: with EPLB the
+kernel runs ``logical + redundant`` physical experts (e.g. 400 for 384 logical),
+but its settings (tile, cluster, schedule hint, combine mode) do not depend on
+the expert count, so the tables of the logical model apply unchanged.
 """
 
 import dataclasses
@@ -183,7 +192,15 @@ def _published_table():
         return None
 
 
-def kernel_settings(bucket: int, hidden: int, intermediate: int, experts: int, topk: int) -> KernelSettings:
+def kernel_settings(bucket: int, hidden: int, intermediate: int, logical_experts: int, topk: int) -> KernelSettings:
+    """Settings of the ``bucket`` variant for a MoE of ``logical_experts`` (NOT the physical count).
+
+    With EPLB the kernel runs more physical experts (redundant replicas), but the settings do not depend on
+    the expert count: the schedule hint's minimum depends on the FC1/FC2 blocks and the cluster count, and
+    combine_dedup only needs EP <= 32. Matching the tables on the physical count (e.g. 400) would silently
+    fall back to ``KernelSettings()`` defaults for every bucket.
+    """
+    experts = logical_experts
     settings = KernelSettings()
     get_params = _published_table()
     if get_params is not None and (hidden, intermediate, experts, topk) == (5120, 2304, 384, 6):
@@ -209,6 +226,68 @@ def kernel_settings(bucket: int, hidden: int, intermediate: int, experts: int, t
             values["schedule_policy"] = _schedule(values["schedule_policy"])
         settings = dataclasses.replace(settings, **values)
     return settings
+
+
+ALLOW_UNVALIDATED_GEOMETRY_ENV = "VLLM_NVFP4_MEGAMOE_ALLOW_UNVALIDATED_GEOMETRY"
+
+# (physical experts, EP size) of NVFP4 layers per (hidden, intermediate, top-k): (validated on GPUs, evidence).
+# Enforced only for layouts WITH redundant experts (physical != logical, i.e. EPLB), which are new with EPLB support:
+# 25 experts per rank (400 at EP16) takes kernel paths that 24 or 96 per rank never ran (the router's scalar
+# per-expert size copy, 25 push CTAs), so every such pair needs its own GPU run before serving. Layouts without
+# redundant experts ran before EPLB support at any EP size and stay admitted (a one-time warning when unlisted), so
+# EPLB-off behaviour is unchanged.
+# Flip a pending pair to True once, at that pair, tests/nvfp4_eplb_gpu_check.py passes ``geometry`` (bitwise table),
+# ``dedup`` (production Rubin table, tolerance) and ``move``, and record the job here.
+NVFP4_GEOMETRIES: dict[tuple[int, int, int], dict[tuple[int, int], tuple[bool, str]]] = {
+    (5120, 2304, 6): {  # DeepSeek-V4.1-Flash
+        (384, 4): (True, "tests/nvfp4_gpu_check.py; DEP4 max-throughput campaign, 2026-11-11"),
+        (384, 16): (True, "deployed DEP16 decode without EPLB"),
+        (388, 4): (False, "pending GPU validation: EPLB with 4 redundant experts at DEP4 (97 per rank)"),
+        (400, 4): (False, "pending GPU validation: EPLB with 16 redundant experts at DEP4 (100 per rank)"),
+        (400, 8): (False, "pending GPU validation: EPLB with 16 redundant experts at DEP8 (50 per rank)"),
+        (400, 16): (False, "pending GPU validation: EPLB with 16 redundant experts at DEP16 (25 per rank)"),
+    },
+}
+_geometry_warned: set[tuple] = set()
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _warn_once(key: tuple, message: str, *args) -> None:
+    if key not in _geometry_warned:  # once per process, not once per layer (43 layers per rank)
+        _geometry_warned.add(key)
+        logger.warning(message, *args)
+
+
+def geometry_unsupported_reason(num_experts: int, ep_size: int, hidden: int, intermediate: int, topk: int, *,
+                                logical_experts: int) -> str | None:
+    """Why NVFP4 layers must not run ``num_experts`` physical experts at EP ``ep_size`` (None: admitted).
+
+    Only layouts with redundant experts (``num_experts != logical_experts``) are refused when not validated; see
+    ``NVFP4_GEOMETRIES``.
+    """
+    table = NVFP4_GEOMETRIES.get((hidden, intermediate, topk), {})
+    entry = table.get((num_experts, ep_size))
+    if entry is not None and entry[0]:
+        return None
+    key = (num_experts, ep_size, hidden, intermediate, topk)
+    if num_experts == logical_experts:
+        _warn_once(key, "NVFP4 MegaMoE: %d experts at EP%d (H=%d, I=%d, top-%d) are not in the validated "
+                   "geometries; admitted (no redundant experts, as before EPLB support)", *key)
+        return None
+    if _env_flag(ALLOW_UNVALIDATED_GEOMETRY_ENV):
+        _warn_once(key, "NVFP4 MegaMoE: running %d physical experts at EP%d (H=%d, I=%d, top-%d), which is not "
+                   "validated (%s)", *key, ALLOW_UNVALIDATED_GEOMETRY_ENV)
+        return None
+    validated = sorted(pair for pair, (ok, _) in table.items() if ok)
+    status = entry[1] if entry is not None else "never ran on GPUs"
+    return (
+        f"NVFP4 MegaMoE has not been validated with {num_experts} physical experts at EP{ep_size} "
+        f"(H={hidden}, I={intermediate}, top-{topk}): {status}. Validated (experts, EP) pairs: {validated}. "
+        f"Set {ALLOW_UNVALIDATED_GEOMETRY_ENV}=1 to run it anyway (for GPU validation)."
+    )
 
 
 def l2_margin() -> float:

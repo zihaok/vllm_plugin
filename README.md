@@ -4,7 +4,9 @@
 > NVFP4 checkpoints (`nvidia/DeepSeek-V4.1-Flash-NVFP4`) on NVIDIA's Rubin MegaMoE
 > kernel with the shared expert fused, and keeps MXFP4 layers (such as the DSpark
 > draft) on this plugin. Enable it with `VLLM_PLUGINS=nvfp4_megamoe`; see
-> [NVFP4.md](NVFP4.md).
+> [NVFP4.md](NVFP4.md). NVFP4 layers support EPLB too, with an explicit
+> `symm_mem` communicator. Their per-slot alpha buffers move with the experts, and
+> their staging maps logical ids to replicas. See [NVFP4.md, EPLB](NVFP4.md#eplb).
 
 Opt-in Rubin SM107 MegaMoE: MXFP8 activations, MXFP4 routed weights, BF16
 output, fused FP8 shared expert, and die-local routed weights. The kernel

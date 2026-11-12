@@ -21,6 +21,17 @@ NVFP4 layers:
   ``w2`` ``input_scale``), folded into ``fc2_alpha = A2 * w2 weight_scale_2``;
 * run one staging launch plus the kernel (router, fused routed + shared FFN,
   top-k reduce adding the shared-expert output) per forward.
+
+EPLB (``--enable-eplb``) on NVFP4 layers:
+
+* the router hands the layer LOGICAL expert ids; the plugin's staging maps them
+  to physical replicas and records the expert load with vLLM's own
+  ``eplb_map_and_record`` (vLLM does this only in the staging the plugin replaces);
+* ``fc1_alpha`` / ``fc2_alpha`` are per-slot buffers allocated at construction and
+  returned by ``get_expert_weights`` next to the eight checkpoint tensors, so EPLB
+  moves them in place with their experts (it has no post-move hook);
+* the kernel needs no change: it addresses experts by physical id over contiguous
+  per-rank blocks and its tuned settings are looked up by the logical count.
 """
 
 import logging
@@ -28,6 +39,7 @@ import math
 import os
 import re
 import types
+import weakref
 from typing import Any, ClassVar
 
 import torch
@@ -43,7 +55,10 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
 from vllm_sm107_megamoe.experts import SM107MegaMoEExperts
 
 from . import layout
-from .config import bucket_for, l2_margin, token_buckets
+from .config import bucket_for, geometry_unsupported_reason, l2_margin, token_buckets
+from .eplb import PLUGIN as _NVFP4_PLUGIN
+from .eplb import UNSUPPORTED_EPLB_COMMUNICATORS as _NVFP4_UNSUPPORTED_EPLB  # noqa: F401 (tests classify with it)
+from .eplb import check_eplb_args, check_eplb_policy, eplb_kernel_args, view_signature
 from .staging import scale_multiplier
 
 logger = logging.getLogger("vllm.plugins.nvfp4_megamoe")
@@ -53,6 +68,9 @@ _ROUTED_NAMES = (
     "w13_weight", "w13_weight_scale", "w13_weight_scale_2", "w13_input_scale",
     "w2_weight", "w2_weight_scale", "w2_weight_scale_2", "w2_input_scale",
 )
+# Per-slot fp32 buffers derived from weight_scale_2 that EPLB must move with the experts (appended to the views).
+_EPLB_ALPHA_NAMES = ("_fc1_alpha", "_fc2_alpha")
+_eplb_logged: set[tuple] = set()
 
 
 def is_nvfp4_routed_layer(vllm_config: Any, prefix: str) -> bool:
@@ -68,19 +86,77 @@ def is_nvfp4_routed_layer(vllm_config: Any, prefix: str) -> bool:
     return int(match.group(1)) < num_layers
 
 
+def check_uniform_target_formats(vllm_config: Any, prefix: str) -> None:
+    """With EPLB, refuse a target model whose MoE layers are not all NVFP4 or all MXFP4.
+
+    EPLB sizes its receive buffer from layer 0's ``get_expert_weights()`` and zips every
+    layer's list with it, which silently truncates: an NVFP4 layer exposes 10 views
+    (8 checkpoint tensors + 2 alphas), an MXFP4 SM107 layer 6 die-local views.
+    Checked at construction of every target layer, before any allocation. Draft layers
+    (index >= num_hidden_layers) are a separate EPLB model or not registered at all.
+    """
+    quant_config = getattr(vllm_config, "quant_config", None)
+    predicate = getattr(quant_config, "_is_nvfp4_expert_layer", None)
+    match = _TARGET_EXPERTS_RE.search(prefix)
+    if predicate is None or match is None:
+        return
+    num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
+    if int(match.group(1)) >= num_layers:
+        return
+    head, tail = prefix[: match.start(1)], prefix[match.end(1):]
+    nvfp4 = [bool(predicate(f"{head}{index}{tail}")) for index in range(num_layers)]
+    if any(nvfp4) and not all(nvfp4):
+        mxfp4 = [index for index, is_nvfp4 in enumerate(nvfp4) if not is_nvfp4]
+        raise NotImplementedError(
+            f"{_NVFP4_PLUGIN}: EPLB needs every target MoE layer in one expert format, but layers {mxfp4} are not "
+            f"NVFP4 (quantization ignore list) while the others are; mixed NVFP4/MXFP4 checkpoints are unsupported "
+            f"with --enable-eplb"
+        )
+
+
+def eplb_model_key(vllm_config: Any, prefix: str) -> str:
+    """Which EPLB model a layer belongs to: the module path before ``layers.N``, target or draft."""
+    match = _TARGET_EXPERTS_RE.search(prefix)
+    if match is None:
+        return prefix
+    root = prefix[: match.start()]
+    text_config = getattr(getattr(vllm_config, "model_config", None), "hf_text_config", None)
+    num_layers = getattr(text_config, "num_hidden_layers", None)
+    if num_layers is None:
+        return root
+    return f"{root}:{'target' if int(match.group(1)) < num_layers else 'draft'}"
+
+
 class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
     """NVFP4 MegaMoE experts on NVIDIA's kernel; any other layer is SM107MegaMoEExperts."""
 
     _nvfp4: bool = False
+    _eplb_enabled: bool = False
+    _eplb_model_key: str = ""
     _nvfp4_runtimes: ClassVar[dict[tuple, Any]] = {}
+    # EPLB view signature per model (eplb_model_key + engine), shared by the NVFP4 and the MXFP4 branch:
+    # (weak reference to the first layer, its prefix, signature). An entry whose first layer is gone is stale.
+    _eplb_view_signatures: ClassVar[dict[str, tuple[Any, str, tuple]]] = {}
 
     def __init__(self, vllm_config: VllmConfig, **kwargs: Any):
-        if not is_nvfp4_routed_layer(vllm_config, kwargs.get("prefix", "")):
+        parallel_config = vllm_config.parallel_config
+        prefix = kwargs.get("prefix", "")
+        # Scoped to this engine: static_forward_context is one dict per VllmConfig, shared by all its layers, so a
+        # second model built in the same process (another EP size or redundancy) does not inherit this signature.
+        context = getattr(getattr(vllm_config, "compilation_config", None), "static_forward_context", None)
+        model_key = eplb_model_key(vllm_config, prefix)
+        if context is not None:
+            model_key = f"{model_key}@{id(context):x}"
+        object.__setattr__(self, "_eplb_model_key", model_key)
+        if parallel_config.enable_eplb:
+            check_uniform_target_formats(vllm_config, prefix)
+        if not is_nvfp4_routed_layer(vllm_config, prefix):
             super().__init__(vllm_config, **kwargs)
             return
-        parallel_config = vllm_config.parallel_config
         if parallel_config.enable_eplb or getattr(parallel_config, "enable_elastic_ep", False):
-            raise NotImplementedError("NVFP4 MegaMoE plugin: EPLB and elastic EP are not supported")
+            # SM107MegaMoEExperts.__init__, which applies the SM107 policy to MXFP4 layers, is skipped below. Refuses
+            # elastic EP, nixl (vLLM's default when NIXL is installed), torch_xccl and NCCL with use_async.
+            check_eplb_policy(parallel_config)
         activation = kwargs["activation"]
         if activation.name != "swiglu" or activation.alpha != 1.0 or activation.beta != 0.0:
             raise NotImplementedError(f"NVFP4 MegaMoE plugin supports plain or clamped SwiGLU, not {activation}")
@@ -101,10 +177,20 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
         self._nvfp4_weights = None
         self._nvfp4_kwargs = None
         self._nvfp4_buckets = token_buckets(self.max_num_tokens)
+        self._eplb_enabled = bool(parallel_config.enable_eplb)
         logger.info(
             "%s: NVFP4 MegaMoE (NVIDIA Rubin kernel, W4A4 routed + fused MXFP8 shared expert), buckets %s",
             self.prefix, self._nvfp4_buckets,
         )
+        if self._eplb_enabled:
+            key = (self.num_experts, self.num_logical_experts, self.num_local_experts)
+            if key not in _eplb_logged:
+                _eplb_logged.add(key)
+                logger.info(
+                    "NVFP4 MegaMoE EPLB: %d physical experts (%d per rank), %d logical, communicator %s",
+                    self.num_experts, self.num_local_experts, self.num_logical_experts,
+                    parallel_config.eplb_config.communicator,
+                )
 
     # ---------------------------------------------------------------------------------------------- weights
     def _kernel_fuses_shared_experts(self, spec: MegaMoEWeightSpec) -> bool:
@@ -116,6 +202,12 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
         if not self._nvfp4:
             return super()._create_weights()
         e, h, i = self.num_local_experts, self.hidden_size, self.intermediate_size
+        # Before any allocation: EPLB layouts (redundant experts) only at (physical experts, EP) pairs that ran on
+        # GPUs (config.NVFP4_GEOMETRIES); layouts without redundant experts are admitted as before.
+        reason = geometry_unsupported_reason(self.num_experts, get_ep_group().world_size, h, i, self.top_k,
+                                             logical_experts=self.num_logical_experts)
+        if reason is not None:
+            raise NotImplementedError(f"{self.prefix}: {reason}")
 
         def register(name: str, data: torch.Tensor) -> None:
             self.register_parameter(name, nn.Parameter(data, requires_grad=False))
@@ -135,6 +227,11 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
             register("shared_l1_weight_scale", torch.zeros(2 * s * (h // 32), dtype=torch.uint8))
             register("shared_l2_weight", torch.zeros(h, s, dtype=torch.uint8))
             register("shared_l2_weight_scale", torch.zeros(h * (s // 32), dtype=torch.uint8))
+        # Per-slot kernel scalars, allocated once here and filled in place by _finalize_nvfp4: stable addresses for
+        # CUDA graphs and for EPLB, which collects get_expert_weights() (alphas included) in load_model, before the
+        # lazy finalize, and moves the rows with their experts. Not checkpoint tensors (non-persistent buffers).
+        for name in (*_EPLB_ALPHA_NAMES, "_fc1_norm_const"):
+            self.register_buffer(name, torch.zeros(e, dtype=torch.float32), persistent=False)
 
     def weight_loader(
         self,
@@ -217,12 +314,13 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
                 layout.write_gate_up_data(param.data, data, layout.gate_up_half(shard_id))
         self._nvfp4_kwargs = None
 
-    def _finalize_nvfp4(self) -> None:
-        """Global scales and kernel views after loading (eager; before CUDA graph capture)."""
-        if self._nvfp4_kwargs is not None:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(f"{self.prefix}: NVFP4 MegaMoE weights must be finalized before graph capture")
+    def _fill_scale_buffers(self) -> tuple[float, float]:
+        """Check the loaded global scales and write the per-slot alphas in place; returns ``(A1, A2)``.
+
+        ``A1``/``A2`` are maxima over all logical experts, so they do not depend on the placement; the alphas
+        are computed from the ``weight_scale_2`` rows currently in each slot. Same arithmetic as before EPLB
+        support (bit-identical kernel scalars).
+        """
         if not torch.equal(self._ws2_13[:, 0], self._ws2_13[:, 1]):
             worst = int((self._ws2_13[:, 0] - self._ws2_13[:, 1]).abs().argmax())
             raise ValueError(
@@ -233,14 +331,70 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
         a2 = float(self._a2_in.max()) * l2_margin()
         if not (a1 > 0 and a2 > 0 and math.isfinite(a1) and math.isfinite(a2)):
             raise ValueError(f"{self.prefix}: NVFP4 input scales not loaded (A1={a1}, A2={a2})")
-        device = self.w13_weight.device
+        if self._eplb_enabled and not self.__dict__.get("_global_scales_checked", False):
+            # A collective: only at the first finalize, which every rank runs in lockstep (a later lazy re-finalize
+            # after a partial reload might run on some ranks only).
+            self._check_global_scales_agree(a1, a2)
+            self._global_scales_checked = True
+        self._place_scale_buffers(self.w13_weight.device)
         ws2_13 = self.w13_weight_scale_2.data[:, 0].to(torch.float32)
+        self._fc1_alpha.copy_(ws2_13 * a1)
+        self._fc2_alpha.copy_(self.w2_weight_scale_2.data.to(torch.float32) * a2)
+        self._fc1_norm_const.fill_(1.0 / a2)
+        return a1, a2
+
+    def _place_scale_buffers(self, device: torch.device) -> None:
+        """Keep the alpha buffers on the weights' device (they are allocated where the module is built)."""
+        if self._fc1_alpha.device == device:
+            return
+        if self._eplb_enabled and self.eplb_state.logical_to_physical_map is not None:
+            raise RuntimeError(
+                f"{self.prefix}: the NVFP4 alpha buffers are on {self._fc1_alpha.device}, the weights on {device}, "
+                "after EPLB collected them; build the layer on the weights' device"
+            )
+        for name in (*_EPLB_ALPHA_NAMES, "_fc1_norm_const"):  # e.g. built on meta; filled right after
+            setattr(self, name, torch.zeros(self.num_local_experts, dtype=torch.float32, device=device))
+
+    def _check_global_scales_agree(self, a1: float, a2: float) -> None:
+        """With EPLB, alpha rows computed on one rank are copied to others: A1/A2 must agree on every rank.
+
+        Each rank records the input_scale of every logical expert, so they agree unless a loader skipped some
+        (e.g. meta tensors); then max() would silently differ between ranks.
+        """
+        ep_group = get_ep_group()
+        if ep_group.world_size == 1:
+            return
+        import torch.distributed as dist
+
+        values = torch.tensor([a1, a2], dtype=torch.float64)
+        low, high = values.clone(), values.clone()
+        dist.all_reduce(low, op=dist.ReduceOp.MIN, group=ep_group.cpu_group)
+        dist.all_reduce(high, op=dist.ReduceOp.MAX, group=ep_group.cpu_group)
+        if not torch.equal(low, high):
+            raise RuntimeError(
+                f"{self.prefix}: NVFP4 global input scales differ across EP ranks (A1 in [{low[0]}, {high[0]}], "
+                f"A2 in [{low[1]}, {high[1]}]); EPLB moves alpha rows between ranks, so every rank must load the "
+                "input_scale of every expert"
+            )
+
+    def _finalize_nvfp4(self) -> None:
+        """Global scales and kernel views after loading (eager; before CUDA graph capture).
+
+        The alpha buffers are written in place, so kernels and graphs bound to them stay valid across a re-finalize
+        (reload). The re-finalize itself only runs from an eager ``forward`` (graph replays skip this Python): after a
+        reload under CUDA graphs, run one eager forward on every rank (or re-capture) before serving, or replays keep
+        the old alphas next to the new weight_scale_2. ``1 / A1`` is passed to staging by value and baked into
+        captured graphs: a reload that changes a w1/w3 input_scale under CUDA graphs needs re-capture.
+        """
+        if self._nvfp4_kwargs is not None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"{self.prefix}: NVFP4 MegaMoE weights must be finalized before graph capture")
+        a1, a2 = self._fill_scale_buffers()
         weights = types.SimpleNamespace(
             w13=self.w13_weight.data, w13_sf=self.w13_weight_scale.data,
             w2=self.w2_weight.data, w2_sf=self.w2_weight_scale.data,
-            fc1_alpha=(ws2_13 * a1).contiguous(),
-            fc2_alpha=(self.w2_weight_scale_2.data.to(torch.float32) * a2).contiguous(),
-            fc1_norm_const=torch.full((self.num_local_experts,), 1.0 / a2, dtype=torch.float32, device=device),
+            fc1_alpha=self._fc1_alpha, fc2_alpha=self._fc2_alpha, fc1_norm_const=self._fc1_norm_const,
             shared_w13=self.shared_l1_weight.data, shared_w13_sf=self.shared_l1_weight_scale.data,
             shared_w2=self.shared_l2_weight.data, shared_w2_sf=self.shared_l2_weight_scale.data,
         )
@@ -264,8 +418,9 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
         self._finalize_nvfp4()
         ep_group = get_ep_group()
         key = (
-            id(ep_group.device_group), torch.cuda.current_device(), self.num_experts, self.max_num_tokens,
-            self.top_k, self.hidden_size, self.intermediate_size, self.num_shared_experts, self.activation.clamp,
+            id(ep_group.device_group), torch.cuda.current_device(), self.num_experts, self.num_logical_experts,
+            self.max_num_tokens, self.top_k, self.hidden_size, self.intermediate_size, self.num_shared_experts,
+            self.activation.clamp,
         )
         runtime = self._nvfp4_runtimes.get(key)
         if runtime is None:
@@ -278,9 +433,17 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
                 intermediate=self.intermediate_size,
                 shared_intermediate=self.intermediate_size * self.num_shared_experts, topk=self.top_k,
                 clamp=self.activation.clamp, max_num_tokens=self.max_num_tokens,
+                num_logical_experts=self.num_logical_experts,
             )
             runtime.compile_all(self._nvfp4_kwargs)
             self._nvfp4_runtimes[key] = runtime
+        # The kernel addresses experts by physical id over contiguous per-rank blocks: it must be built for this
+        # layer's physical count and slots (staging hands it physical ids when EPLB is on).
+        if (runtime.num_experts, runtime.num_local_experts) != (self.num_experts, self.num_local_experts):
+            raise RuntimeError(
+                f"{self.prefix}: NVFP4 MegaMoE runtime built for {runtime.num_experts} experts "
+                f"({runtime.num_local_experts} per rank), layer has {self.num_experts} ({self.num_local_experts})"
+            )
         object.__setattr__(self, "_nvfp4_runtime", runtime)
         return runtime
 
@@ -290,9 +453,53 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
         return bucket_for(self._nvfp4_buckets, num_tokens)
 
     def get_expert_weights(self) -> list[torch.Tensor]:
-        if self._nvfp4:
-            raise NotImplementedError("NVFP4 MegaMoE plugin: EPLB is not supported")
-        return super().get_expert_weights()
+        """Routed tensors as ``(num_local_experts, -1)`` views for EPLB, which moves them row by row in place.
+
+        NVFP4 layers: the eight checkpoint tensors (vLLM's native views, shared expert excluded), then the
+        ``fc1_alpha`` and ``fc2_alpha`` buffers, so each slot's kernel scalars follow its expert. EPLB has no
+        post-move hook; a moved expert with its old slot's alphas would run with ws2[old] / ws2[new] scaling.
+        MXFP4 layers keep the SM107 plugin's die-local views. Either way, every layer of one model must return
+        the same view signature: EPLB shapes its buffers from layer 0 and zips (truncates) the others.
+        """
+        if not self._nvfp4:
+            views = super().get_expert_weights()
+        else:
+            e = self.num_local_experts
+            names = tuple(n for n, _ in self.named_parameters(recurse=False) if not n.startswith("shared_"))
+            if names != _ROUTED_NAMES:
+                raise AssertionError(f"{self.prefix}: NVFP4 routed parameters {names}, expected {_ROUTED_NAMES}")
+            views = DeepGemmMegaMoEExperts.get_expert_weights(self)
+            views += [getattr(self, name).view(e, 1) for name in _EPLB_ALPHA_NAMES]
+            sources = [getattr(self, name).data for name in names] + [getattr(self, n) for n in _EPLB_ALPHA_NAMES]
+            for name, view, tensor in zip(names + _EPLB_ALPHA_NAMES, views, sources, strict=True):
+                # EPLB writes the kernel's memory through the view: it must cover the tensor exactly, in place.
+                if (
+                    view.data_ptr() != tensor.data_ptr()
+                    or view.numel() != tensor.numel()
+                    or not view.is_contiguous()
+                    or view.dim() != 2
+                    or view.shape[0] != e
+                ):
+                    raise AssertionError(
+                        f"{self.prefix}: NVFP4 MegaMoE EPLB {name}: the view does not cover its memory in place "
+                        f"(shape {tuple(view.shape)}, tensor {tuple(tensor.shape)})"
+                    )
+        self._check_eplb_signature(views)
+        return views
+
+    def _check_eplb_signature(self, views: list[torch.Tensor]) -> None:
+        signature = view_signature(views)
+        entry = self._eplb_view_signatures.get(self._eplb_model_key)
+        if entry is None or entry[0]() is None:  # first layer of this model, or a dead model's entry (id reuse)
+            self._eplb_view_signatures[self._eplb_model_key] = (weakref.ref(self), self.prefix, signature)
+            return
+        _, first, known = entry
+        if known != signature:
+            raise RuntimeError(
+                f"{self.prefix}: EPLB views {signature} differ from those of {first} {known}; EPLB sizes its "
+                "buffers from the first layer and would silently truncate or misplace the rest (mixed NVFP4/MXFP4 "
+                "layers are unsupported with EPLB)"
+            )
 
     def _bucket_tokens(self, num_tokens: int) -> int:
         """Tokens that size the kernel variant: the most any DP rank runs, so every EP rank agrees."""
@@ -328,13 +535,16 @@ class VllmNvfp4MegaMoEExperts(SM107MegaMoEExperts):
                 is_padding = get_forward_context().is_padding
                 if is_padding is not None:
                     is_padding = is_padding[:num_tokens]
+        # Capture logical ids; staging maps them to EPLB physical replicas (as vLLM's native forward).
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
         if hidden_states.stride(-1) != 1 or hidden_states.stride(0) != self.hidden_size:
             hidden_states = hidden_states.contiguous()
+        eplb = eplb_kernel_args(self.eplb_state)
+        check_eplb_args(eplb, self.num_logical_experts, self.num_experts, self.prefix)
         y = runtime.run(
             hidden_states, topk_ids, topk_weights, is_padding, bucket=bucket, layer_kwargs=self._nvfp4_kwargs,
-            norm=self._input_norm_const, scale_mul=self._scale_mul,
+            norm=self._input_norm_const, scale_mul=self._scale_mul, eplb=eplb,
         )
         return y[:num_tokens]
 

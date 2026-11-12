@@ -13,7 +13,9 @@ From ``x [n, H]`` BF16 it writes, in one read of ``x``:
   flat 32x4x4 swizzled scale layout;
 * the routing: ids as int32 and weights as fp32 for the ``rows`` rows of the
   kernel variant, ``-1`` / ``0`` for rows ``>= n`` and for rows vLLM marks as
-  padding.
+  padding. With EPLB, the logical ids are mapped to physical replicas and the
+  expert load is recorded on the way, by vLLM's own ``eplb_map_and_record``
+  exactly as vLLM's MegaMoE staging calls it (``prepare_megamoe._store_topk``).
 
 ``x`` is read as 32-bit words (two BF16 each), so every 16- and 32-value group is
 a ``[2, 8]``-word tile held by one program, and FP4 pairs are packed with the
@@ -23,6 +25,9 @@ hardware ``cvt.rn.satfinite.e2m1x2.f32``.
 import torch
 import triton
 import triton.language as tl
+from vllm.model_executor.layers.fused_moe.eplb_triton import eplb_map_and_record
+
+from .eplb import INERT_EPLB_ARGS
 
 E4M3_MAX_C = tl.constexpr(448.0)
 
@@ -33,8 +38,9 @@ def _stage_kernel(
     act_ptr, act_sf_ptr, sh_ptr, sh_sf_ptr, ids_out_ptr, w_out_ptr,
     norm, scale_mul, num_tokens, num_rows,
     stride_xw, stride_ids, stride_w,
+    l2p_ptr, replica_ptr, load_ptr, record_ptr, unpadded_ptr, num_logical, map_stride, num_physical,
     H: tl.constexpr, TOPK: tl.constexpr, BLOCK_TOPK: tl.constexpr,
-    BLOCK_M: tl.constexpr, GROUPS: tl.constexpr, HAS_PAD: tl.constexpr,
+    BLOCK_M: tl.constexpr, GROUPS: tl.constexpr, HAS_PAD: tl.constexpr, HAS_EPLB: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -96,6 +102,15 @@ def _stage_kernel(
             pad = tl.load(pad_ptr + rr, mask=live, other=1) != 0
             ids = tl.where(pad[:, None], -1, ids)
             wts = tl.where(pad[:, None], 0.0, wts)
+        if HAS_EPLB:
+            # Logical -> physical replica (Knuth hash of the row index picks among the replicas) and one load count
+            # per live, unpadded (row, k) with a valid id; padding and rows >= num_tokens are -1 and not counted.
+            # The same call, token index and mask as vLLM's staging, so the staged ids and the recorded load are
+            # bit-equal to it. This block runs once per row (first column block only), so each route counts once.
+            ids = eplb_map_and_record(
+                ids.to(tl.int64), rr[:, None], lmask, l2p_ptr, replica_ptr, num_logical, map_stride, load_ptr,
+                num_physical, record_ptr, unpadded_ptr,
+            ).to(tl.int32)
         omask = (rr < num_rows)[:, None] & kmask
         tl.store(ids_out_ptr + rr[:, None] * TOPK + kk[None, :], ids, mask=omask)
         tl.store(w_out_ptr + rr[:, None] * TOPK + kk[None, :], wts, mask=omask)
@@ -128,6 +143,7 @@ def stage_nvfp4_mxfp8(
     shared_act_sf: torch.Tensor,
     ids_out: torch.Tensor,
     weights_out: torch.Tensor,
+    eplb: tuple | None = None,
 ) -> None:
     """Stage ``x`` and the routing for a kernel variant of ``rows`` token rows.
 
@@ -135,6 +151,10 @@ def stage_nvfp4_mxfp8(
     ``shared_act`` ``[>= n, H]`` float8_e4m3fn, ``shared_act_sf`` flat uint8 of at
     least ``round_up(n, 128) * H / 32``, ``ids_out`` / ``weights_out`` ``[>= rows,
     topk]`` int32 / float32, all contiguous.
+
+    ``eplb`` is ``eplb.eplb_kernel_args(layer.eplb_state)``. Without it (or when it is
+    inert) the kernel specializes to the plain staging (``HAS_EPLB`` False): the
+    staged bytes are exactly those of a build without EPLB support.
     """
     num_tokens, hidden = x.shape
     topk = topk_ids.shape[1]
@@ -147,11 +167,15 @@ def stage_nvfp4_mxfp8(
     grid = (triton.cdiv(rows, block_m), hidden // (32 * groups))
     has_pad = is_padding is not None
     pad = is_padding.view(torch.uint8) if has_pad else ids_out
+    if eplb is None:
+        eplb = INERT_EPLB_ARGS
+    has_eplb = eplb[0] is not None
     _stage_kernel[grid](
         xw, topk_ids, topk_weights, pad,
         act, act_sf, shared_act.view(torch.uint16), shared_act_sf, ids_out, weights_out,
         norm, scale_mul, num_tokens, rows,
         xw.stride(0), topk_ids.stride(0), topk_weights.stride(0),
+        *eplb,
         H=hidden, TOPK=topk, BLOCK_TOPK=triton.next_power_of_2(topk),
-        BLOCK_M=block_m, GROUPS=groups, HAS_PAD=has_pad, num_warps=warps,
+        BLOCK_M=block_m, GROUPS=groups, HAS_PAD=has_pad, HAS_EPLB=has_eplb, num_warps=warps,
     )

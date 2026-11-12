@@ -239,6 +239,9 @@ def main():
     parser.add_argument("--time-tokens", default="8190,4608")
     parser.add_argument("--out", default="")
     cli = parser.parse_args()
+    # A validation run: admit any geometry (E=384 without redundant experts is admitted anyway; this is for the
+    # EPLB GPU check, which imports this module).
+    os.environ.setdefault("VLLM_NVFP4_MEGAMOE_ALLOW_UNVALIDATED_GEOMETRY", "1")
     rank, local, world = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local))
